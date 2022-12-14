@@ -48,8 +48,20 @@ misstable sum, all
 * ID variable must contain non-duplicates
 duplicates report woman_id // No duplicates found
 
+* 1 missing record
+drop if woman_id == 13
+
+* 1 non-valid observation found
+drop if age >= 75
+
 * 1 non-valid value found in address
 replace address = "" if !inlist(address, "Kungsholmen", "Solna", "Sodermalm")
+
+* 1 non-valid combination with response for non contraceptive_pill user
+replace contraceptive_pill = years_pill > 0 & years_pill != .
+
+* 1 observation missing anc_visit
+drop if anc_visit == .
 
 * Encode categorical data
 encode address, generate(district)
