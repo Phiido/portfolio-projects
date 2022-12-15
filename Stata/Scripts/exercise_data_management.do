@@ -45,23 +45,33 @@ list in 1/5
 misstable sum, all
 
 * ----------------- Validate and clean data
-* ID variable must contain non-duplicates
+* ID variable must contain distinct values
 duplicates report woman_id // No duplicates found
 
-* 1 missing record
-drop if woman_id == 13
-
 * 1 non-valid observation found
-drop if age >= 75
+drop if age >= 50
 
 * 1 non-valid value found in address
 replace address = "" if !inlist(address, "Kungsholmen", "Solna", "Sodermalm")
 
 * 1 non-valid combination with response for non contraceptive_pill user
-replace contraceptive_pill = years_pill > 0 & years_pill != .
+drop if contraceptive_pill == 0 & years_pill > 0 & years_pill != .
 
-* 1 observation missing anc_visit
-drop if anc_visit == .
+* Dirty method to keep wanted missing values before recursion
+replace years_pill = 0 if years_pill == .
+
+* Finding and removing missing values recursively
+ds, has(type numeric)
+foreach v of var `r(varlist)' {
+	drop if `v' == .
+}
+
+ds, has(type string)
+foreach v of var `r(varlist)' {
+	drop if `v' == ""
+}
+
+replace years_pill = . if years_pill == 0
 
 * Encode categorical data
 encode address, generate(district)
