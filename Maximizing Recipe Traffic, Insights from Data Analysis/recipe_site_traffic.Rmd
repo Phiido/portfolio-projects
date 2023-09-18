@@ -1,0 +1,413 @@
+---
+output:
+  html_document: default
+editor_options:
+  markdown:
+    wrap: 72
+---
+# Maximizing Recipe Traffic: Insights from Data Analysis
+Thomas Roosdorp
+2023-01-31
+
+```{r Setup, message = FALSE, warning = FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+
+# for showcasing interpretation of a single seed
+set.seed(50)
+
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(pROC)
+
+```
+
+```{r Data}
+
+# Load the data
+url_data <-
+  "https://s3.amazonaws.com/talent-assets.datacamp.com/recipe_site_traffic_2212.csv"
+
+recipe_data <- as.data.frame(readr::read_csv(url_data))
+
+# Adding custom functions used in cleaning
+detect_outlier <- function(x) {
+  Q1 <- quantile(x, probs = 0.25)
+  Q3 <- quantile(x, probs = 0.75)
+  IQR <- IQR(x)
+  
+  x > Q3 + IQR * 1.5 | x < Q1 - IQR * 1.5
+}
+
+remove_outlier <- function(df, cols = names(df)) {
+  for (col in cols) {
+    outliers <- detect_outlier(df[[col]])
+    df <- df[!outliers, ]
+  }
+  return(invisible(df))
+}
+
+cube_transform <- function(x) {
+  x ^ (1/3)
+}
+```
+
+## Background
+
+I have been tasked to do a data exploration and analysis of a data set
+on recipes hosted on Tasty Bytes. Also, to use machine learning models
+to help predict which recipes will receive high traffic, in order to
+confidently select which recipes to display on on the home page, with
+the ambition to increase site traffic and in turn increase the number of
+subscriptions.
+
+## Data validation
+
+```{r}
+
+str(recipe_data)
+
+```
+
+The original data set contains 947 observations as well as 8 columns. I
+began by investigating and validating all variables. The columns are all
+described as in the presented data dictionary and with summary of
+changes made:
+
+-   recipe: Numeric, unique identifier of recipe
+
+    -   Converted to numeric from char; No cleaning needed
+
+-   calories: Numeric, number of calories (kcal)
+
+    -   Cleaning done: removed outliers and missing
+
+-   carbohydrate: Numeric, number of carbohydrates (gram)
+
+    -   Cleaning done: removed outliers and missing
+
+-   sugar: Numeric, number of sugars (gram)
+
+    -   Cleaning done: removed outliers and missing
+
+-   protein: Numeric, number of protein (gram)
+
+    -   Cleaning done: removed outliers and missing
+
+-   category: Nominal, type of recipe. 10 categories
+
+    -   Validation: consolidated "Chicken Breast" (n=98) into "Chicken"
+
+-   servings: Ordinal, number of servings for the recipe
+
+    -   Cleaning and validation: coerced non-valid categories '4 as a
+        snack' (n=2) and '6 as a snack' (n=1) to missing, removed
+        missing
+
+-   high_traffic: Nominal, indicator if a recipe received high traffic
+
+Validation done: Only had 'High' values and NA, converted NA to 'Low',
+and then coerced as factor Validation included compressing Category
+values "Chicken Breast" into "Chicken" and removing non-valid values
+from the Servings variable. Outliers that went outside the 1.5 times IQR
+were removed as well. Missing values were removed completely as imputing
+them with median values decreased the accuracy in the constructed
+models.
+
+```{r Validation}
+
+# validate and clean data set
+recipe_data_clean <- recipe_data |>
+  mutate(
+    category = ifelse(category == "Chicken Breast", "Chicken", category), # Consolidate types
+    high_traffic = ifelse(is.na(high_traffic), "Low", high_traffic), # Create binary values
+    high_traffic = factor(high_traffic, levels = c("Low", "High")), # Turn into factors
+    across(c(recipe, servings), as.integer), # Introduces NA for non valid values
+    across(c(category, servings), as.factor)) |>
+  drop_na() |> # Remove missing values; imputing median did not improve accuracy
+  remove_outlier(cols = c("calories", "carbohydrate", "sugar", "protein"))
+```
+
+```{r}
+# validate 10 types of categories
+levels(recipe_data_clean$category)
+```
+
+```{r}
+# validate 4 types of servings
+levels(recipe_data_clean$servings)
+```
+
+```{r}
+# validate high or low traffic
+levels(recipe_data_clean$high_traffic)
+```
+
+```{r}
+# validate any negative values in numeric variables
+summary(recipe_data_clean)
+```
+
+```{r}
+str(recipe_data_clean)
+```
+
+The data set was reduced down to 661 observations after cleaning.
+
+## Exploratory Analysis
+
+Visual exploration was used to investigate the target variable 'high
+traffic' and features of the recipe data, as well as the relationship
+between the target variable and features. Following the preliminary
+analysis, I decided to implement the following changes to enable more
+accurate modeling, cube root transformation on all numerical variables
+(calories, carbohydrate, sugar, protein) as they were heavily skewed in
+their distribution.
+
+```{r Transformation}
+# transform numerical variables in cube scale
+recipe_data_transf <- recipe_data_clean |>
+  mutate(across(c(calories, carbohydrate, sugar, protein), cube_transform))
+```
+
+### Numeric Variables
+
+We can see from the histogram below that the distribution of calories is
+substantially skewed to the right, as was the case for all of the other
+numerical variables. Therefore, I applied a cube transformation (log and
+square root did not normalize as much) of the numerical variables as
+previously mentioned, the distribution of the transformed values is
+closer to a normal distribution.
+
+```{r Numeric Variable}
+
+# plot histogram distribution of a single variable
+recipe_data_clean |>
+  ggplot(aes(x = calories)) +
+  geom_histogram(binwidth = 50) +
+  labs(title = "Distribution of calories in recipes",
+       x = "Calories (kcal)",
+       y = "Count") +
+  theme_minimal()
+
+```
+
+### Target Variable - High Traffic
+
+Because we need to predict if a recipe will receive a lot of traffic,
+we'll use the high_traffic variable as our target variable, also known
+as the *response variable*.
+
+We can see in the graph below that the categories with the fewest
+recipes are 'Dessert', 'One Dish Meal', and 'Pork', while the categories
+with the most recipes are 'Beverages', 'Breakfast', and 'Chicken'.
+
+```{r Response variable}
+
+# plotting a single variable
+recipe_data_clean |>
+  ggplot(aes(x = fct_rev(fct_infreq(category)))) +
+  geom_bar(fill = "darkturquoise") +
+  labs(title = "Number of recipes grouped by category",
+       x = "",
+       y = "Count (n)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, vjust = 1.5, hjust = 1))
+```
+
+```{r Multi Variable}
+
+# plot the relationship between high_traffic and category
+recipe_data_clean |>
+  mutate(category = fct_rev(fct_reorder(category, 
+                                        high_traffic, 
+                                        .fun = function(.x) mean(as.numeric(.x)), 
+                                        .desc = TRUE))) |>
+  ggplot(aes(x = category, fill = high_traffic)) +
+  geom_bar(position = "fill") +
+  labs(title = "Proportion of site traffic within categories",
+       x = "",
+       y = "Proportion",
+       fill = "Traffic") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, vjust = 1.5, hjust = 1))
+```
+
+\
+At first appearance, high traffic recipes appear to be more focused in
+the categories 'Vegetables' and 'Potato'. Low traffic recipes are
+typically found in the 'Breakfast' and 'Beverage' categories. In
+comparison, the 'Chicken' category with the greatest frequency count
+appears to be closer to the bottom ranked categories in terms of high
+traffic counts, indicating the possibility for improvement in site
+traffic. The same goes for the category 'Beverages' which is among the
+highest count of recipes but being in the most bottom of high traffic
+proportions.
+
+## Model development
+
+Predicting whether or not a recipe will be popular is a classification
+problem in machine learning. Because the response variable is binary,
+I've chosen *logistic regression* as the baseline model. The comparison
+model I am choosing is a *Random Forest classification*.
+
+### Model preparation
+
+To enable modeling, I chose *high_traffic* as response variable and the
+following as explanatory variables: calories, carbohydrate, sugar,
+protein, category, servings. I have also split the data into a training
+set and a test set.
+
+```{r, Model prep}
+
+# Assemble formula for models
+response <- "high_traffic"
+predictors <- c("calories",
+                "carbohydrate",
+                "sugar",
+                "protein",
+                "category",
+                "servings")
+fmla_all <- formula(paste(response, "~", paste0(predictors, collapse = " + ")))
+
+# split data set into a training and testing sets
+split_index <- createDataPartition(recipe_data_clean$high_traffic,
+                                   p = 0.5,
+                                   list = FALSE)
+
+train_data  <- recipe_data_clean[split_index, -1]
+test_data   <- recipe_data_clean[-split_index, -1]
+```
+
+### Baseline Model - Logistic Regression
+
+With all explanatory variables, a baseline model was created using
+logistic regression. Even when normal or transformed, the numerical
+variables added little significance or accuracy to the models. As a
+result, they were dropped for the comparison model. The most important
+predictions were selected (without losing accuracy). The 'category'
+variable remained the most significant predictor.
+
+```{r Baseline Model}
+
+# Baseline model: Logistic regression with all predictors
+model_logistic <- glm(fmla_all, family = "binomial", data = train_data)
+
+summary(model_logistic)
+
+# Assemble adjusted formula for feature importance selection
+fmla_adj <- formula(paste(response, "~", predictors[5]))
+
+# predict data on test set from model
+test_data <- test_data |>
+  mutate(
+    predicted_prob = predict(model_logistic,
+                             newdata = test_data,
+                             type = "response"),
+    predicted = factor(round(predicted_prob), labels = c("Low", "High"))
+  )
+
+# create confusion matrix for performance estimates
+cm_logistic <- confusionMatrix(test_data$predicted, test_data$high_traffic, positive = "High")
+```
+
+### Comparison Model
+
+The chosen comparison model is a *Random Forest*, which fared just
+marginally better than a Decision Tree model. First, I try to find the
+optimal cutoff point for the Random Forest Model, and then I predict
+using the model with the best fit.
+
+```{r Comparison Model}
+
+# random forest with single explanatory variable
+model_forest <- randomForest(fmla_adj, data = train_data, importance = TRUE)
+mtry <- tuneRF(train_data[-7], train_data$high_traffic, trace = FALSE, plot = FALSE)
+
+# determine the cutoff for the best fit
+best_m <- mtry[mtry[, 2] == min(mtry[, 2]), 1]
+
+model_forest2 <- randomForest(fmla_adj,
+                              data = train_data,
+                              mtry = best_m,
+                              importance = TRUE)
+
+# predict data on test set from model
+prob_forest <- predict(model_forest2, newdata = test_data, type = "prob")
+pred_forest <- predict(model_forest2, newdata = test_data, type = "class")
+
+# create confusion matrix for performance estimates
+cm_forest <- confusionMatrix(test_data$high_traffic, pred_forest, positive = "High")
+```
+
+## Model evaluation
+
+I am evaluating the models using the following metrics, accuracy and AUC
+(Area Under the Receiver Operating Characteristic). Accuracy is a common
+metric for evaluating binary classification models which represents the
+proportion of true results. AUC is a another common metric, and it
+measures the model's ability to distinguish between the two classes.
+
+```{r Model Evaluation}
+
+# create performance evaluators
+roc_logistic <- roc(response = test_data$high_traffic,
+                    predictor = test_data$predicted_prob)
+roc_forest <- roc(response = test_data$high_traffic, 
+                  predictor = prob_forest[, 2])
+
+message(paste("Logistic Regression AUC:", round(auc(roc_logistic), 2)))
+message(paste("Random Forest AUC:", round(auc(roc_forest), 2)))
+
+message(paste0("Logistic Regression Accuracy: ", round(cm_logistic$overall[1] * 100), "%"))
+message(paste0("Random Forest Accuracy: ", round(cm_forest$overall[1] * 100), "%"))
+
+plot(roc_logistic, col = "green")
+plot(roc_forest, add = TRUE, col = "red")
+
+```
+
+The AUC of the Logistic Regression is 0.85, and the Random Forest model
+is 0.86, meaning they perform almost equally well (as seen in the ROC
+plot). The accuracy of the Logistic Regression is 77% and for the Random
+Forest model is 80%, meaning the latter is slightly better in predicting
+values.
+
+## Business metrics
+
+Tasty Bytes wants to predict which recipes will achieve high traffic,
+with an accuracy of approximately 80%. The created models tend to
+predict with an accuracy close to 80%, but not all the time. I was
+unable to improve the models accuracy to be consistently above 80%. When
+adjusting features for the baseline model of Logistic Regression, it
+produced similar values to the Random Forest. One consideration for
+future evaluation is that Logistic Regression could rather be used as it
+tends to be less resource demanding on systems.
+
+After evaluating the models, I would recommend the company to use the
+Random Forest model's accuracy as a metric or KPI, in order to compare
+prediction abilities.
+
+For comparing the performance of the two models with future data, I
+would suggest using the AUC in order to maintain consistent performance
+and see if prediction rates improve as well.
+
+## Summary
+
+We can employ this Random Forest model to assist the product manager in
+better predicting which recipes would generate high traffic. By adopting
+this model, approximately 80% of the predictions will ensure that
+recipes with high traffic are chosen. This will assist the product
+manager gain confidence in increasing site visitors.
+
+Based on the initial findings of the analysis, I would propose that the
+company focus on promoting particular recipe categories that have been
+observed to be connected with high traffic, such as 'Pork', 'Potato',
+and 'Vegetable'. This could be accomplished through targeted marketing
+efforts or by emphasizing specific recipe categories on the website.
+Furthermore, the company should research why breakfast and beverages are
+related with low traffic and develop measures to increase the appeal of
+these dish categories. It is possible that the recipes for breakfast and
+beverages are not enticing enough, or that they are not adequately
+marketed. The company might revise the recipes or promote them more
+effectively.
